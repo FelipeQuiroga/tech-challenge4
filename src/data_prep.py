@@ -59,6 +59,11 @@ def _clean_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     chunk["emp_length"] = _parse_emp_length(chunk["emp_length"])
     chunk["int_rate"] = _parse_int_rate(chunk["int_rate"])
     chunk["revol_util"] = _parse_int_rate(chunk["revol_util"])  # também vem com '%'
+
+    # Winsorização de renda: o dado bruto tem outliers extremos (ex.: renda
+    # anual de US$ 9 milhões) que distorcem tanto o treino quanto o binning
+    # usado no cálculo de PSI. Cap em um valor alto, porém plausível.
+    chunk["annual_inc"] = chunk["annual_inc"].clip(upper=500_000)
     chunk = chunk[chunk["loan_status"].isin(config.VALID_LOAN_STATUS)]
     chunk[config.TARGET_COLUMN] = chunk["loan_status"].map(config.VALID_LOAN_STATUS).astype(int)
 
@@ -70,19 +75,6 @@ def _clean_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     chunk = chunk[chunk["term"].isin([36, 60])]
     chunk["term"] = chunk["term"].astype(int)
     return chunk
-
-
-def _sample_df(df: pd.DataFrame, n: int, random_state: int) -> pd.DataFrame:
-    if len(df) <= n:
-        return df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
-    # amostragem estratificada pelo target para preservar a taxa de default
-    frac = n / len(df)
-    sampled = (
-        df.groupby(config.TARGET_COLUMN, group_keys=False)
-        .apply(lambda g: g.sample(frac=frac, random_state=random_state), include_groups=False)
-    )
-    sampled[config.TARGET_COLUMN] = df.loc[sampled.index, config.TARGET_COLUMN]
-    return sampled.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
 
 
 def build_reference_and_production(
@@ -99,14 +91,14 @@ def build_reference_and_production(
         )
 
     usecols = config.ALL_USECOLS
-    ref_chunks: list[pd.DataFrame] = []
-    prod_chunks: list[pd.DataFrame] = []
+    pool_chunks: list[pd.DataFrame] = []
     max_year_seen = 0
     rows_read = 0
 
-    target_ref = sample_size_reference * 4
-    target_prod = sample_size_production * 4
-    max_prod_year = max(config.PRODUCTION_ISSUE_YEARS)
+    # Pool único (mesma safra) de onde referência e produção-base serão
+    # sorteadas SEM sobreposição — ver comentário em config.BASE_ISSUE_YEARS.
+    target_pool = (sample_size_reference + sample_size_production) * 3
+    max_base_year = max(config.BASE_ISSUE_YEARS)
 
     with _open_accepted_stream(zip_path) as stream:
         reader = pd.read_csv(
@@ -123,30 +115,46 @@ def build_reference_and_production(
                 continue
             max_year_seen = max(max_year_seen, int(chunk["issue_year"].max(skipna=True) or 0))
 
-            ref_part = chunk[chunk["issue_year"].isin(config.REFERENCE_ISSUE_YEARS)]
-            if not ref_part.empty:
-                ref_chunks.append(ref_part)
+            base_part = chunk[chunk["issue_year"].isin(config.BASE_ISSUE_YEARS)]
+            if not base_part.empty:
+                pool_chunks.append(base_part)
 
-            prod_part = chunk[chunk["issue_year"].isin(config.PRODUCTION_ISSUE_YEARS)]
-            if not prod_part.empty:
-                prod_chunks.append(prod_part)
-
-            have_enough = (
-                sum(len(c) for c in ref_chunks) >= target_ref
-                and sum(len(c) for c in prod_chunks) >= target_prod
-            )
-            if have_enough and max_year_seen > max_prod_year:
+            pool_size = sum(len(c) for c in pool_chunks)
+            if pool_size >= target_pool and max_year_seen > max_base_year:
                 logger.info("Coleta suficiente após %s linhas lidas; parando leitura.", rows_read)
                 break
 
-    if not ref_chunks or not prod_chunks:
+    if not pool_chunks:
         raise RuntimeError("Não foi possível coletar linhas suficientes para referência/produção.")
 
-    ref_df = pd.concat(ref_chunks, ignore_index=True)
-    prod_df = pd.concat(prod_chunks, ignore_index=True)
+    pool_df = pd.concat(pool_chunks, ignore_index=True)
+    if len(pool_df) < sample_size_reference + sample_size_production:
+        raise RuntimeError(
+            f"Pool de {len(pool_df)} linhas insuficiente para "
+            f"{sample_size_reference}+{sample_size_production} amostras sem sobreposição."
+        )
 
-    ref_df = _sample_df(ref_df, sample_size_reference, config.RANDOM_STATE)
-    prod_df = _sample_df(prod_df, sample_size_production, config.RANDOM_STATE)
+    # Split estratificado SEM sobreposição: uma parte vira referência, outra
+    # vira a base da produção (antes de qualquer drift sintético). Usar
+    # train_test_split garante partições disjuntas por construção.
+    from sklearn.model_selection import train_test_split
+
+    total_needed = sample_size_reference + sample_size_production
+    if len(pool_df) > total_needed:
+        pool_df, _ = train_test_split(
+            pool_df,
+            train_size=total_needed,
+            random_state=config.RANDOM_STATE,
+            stratify=pool_df[config.TARGET_COLUMN],
+        )
+    ref_df, prod_df = train_test_split(
+        pool_df,
+        train_size=sample_size_reference,
+        test_size=sample_size_production,
+        random_state=config.RANDOM_STATE,
+        stratify=pool_df[config.TARGET_COLUMN],
+    )
+    ref_df = ref_df.reset_index(drop=True)
     prod_df = prod_df.sort_values("issue_date").reset_index(drop=True)
 
     keep_cols = config.FEATURE_COLUMNS + [config.TARGET_COLUMN, "issue_date", "issue_year"]

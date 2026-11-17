@@ -71,11 +71,16 @@ TARGET_COLUMN = "target"  # 1 = Charged Off (default), 0 = Fully Paid
 VALID_LOAN_STATUS = {"Fully Paid": 0, "Charged Off": 1}
 
 # --------------------------------------------------------------------------
-# Janelas temporais: referência (treino do baseline) vs produção (onde o
-# drift será simulado e detectado).
+# Janela temporal base: referência e produção-base vêm do MESMO ano-safra
+# (2015), amostradas sem sobreposição. Isso isola o efeito do drift
+# sintético injetado em `simulate_drift.py` — sem essa separação, o drift
+# "natural" real entre safras diferentes da Lending Club (mudanças de
+# política de crédito ao longo dos anos) se misturaria com o drift
+# intencional e poluiria a demonstração estatística. A passagem do tempo em
+# produção é simulada fatiando esse pool em lotes e aplicando perturbação
+# crescente (ver simulate_drift.py), não usando anos-calendário diferentes.
 # --------------------------------------------------------------------------
-REFERENCE_ISSUE_YEARS = {2015}
-PRODUCTION_ISSUE_YEARS = {2016, 2017}
+BASE_ISSUE_YEARS = {2015}
 
 SAMPLE_SIZE_REFERENCE = 60_000
 SAMPLE_SIZE_PRODUCTION = 60_000
