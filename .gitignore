@@ -9,3 +9,4 @@ mlartifacts/
 logs/*.jsonl
 *.egg-info/
 .ipynb_checkpoints/
+apresentacao/
